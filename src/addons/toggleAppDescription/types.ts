@@ -1,8 +1,5 @@
 /** アプリ説明欄の表示状態 */
-export type DescriptionDisplayState = 'OPEN' | 'CLOSED';
-
-/** アプリ説明欄の内部状態（HIDDEN含む） */
-export type DescriptionInternalState = DescriptionDisplayState | 'HIDDEN';
+export type DescriptionDisplayState = "OPEN" | "CLOSED";
 
 /** kintone.appオブジェクトの型定義 */
 export interface KintoneApp {
@@ -10,8 +7,6 @@ export interface KintoneApp {
   getId(): number | null;
   /** アプリ説明欄の表示状態を変更 */
   showDescription(state: DescriptionDisplayState): Promise<void>;
-  /** アプリ説明欄の現在の状態を取得 */
-  getDescriptionDisplayState(): Promise<DescriptionInternalState>;
 }
 
 /** kintone.eventsオブジェクトの型定義 */
