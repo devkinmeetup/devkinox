@@ -79,14 +79,19 @@ document.addEventListener("DOMContentLoaded", async () => {
         );
       }
     };
-
     slotDiv.appendChild(button);
     buttonsGridDiv.appendChild(slotDiv);
   }
 
   const container = document.querySelector<HTMLElement>('.button-section');
   if (!container) {
-    throw new Error('.button-section element not found');
+    alert(
+      "ボタン情報を取得できませんでした。ブラウザを再起動するか、拡張機能を再読み込みしてみてください。",
+    );
+    console.warn(
+      "[kintone Dev Tools] .button-section element not found",
+    );
+    throw new Error('');
   }
   const swapy = createSwapy(container, {
     animation: 'dynamic'
