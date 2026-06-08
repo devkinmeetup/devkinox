@@ -1,5 +1,6 @@
 import { loadAddons, getCurrentTab, executeScriptByFile } from "./core.js";
 import type { AddonDefinition } from "./core.js";
+import { createSwapy } from 'swapy'
 
 document.addEventListener("DOMContentLoaded", async () => {
   const addons: AddonDefinition[] = await loadAddons();
@@ -19,8 +20,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   buttonsGridDiv.style.display = "grid";
 
   for (const addon of addons) {
+    const slotDiv = document.createElement("div");
+    slotDiv.dataset.swapySlot = addon.id;
+    slotDiv.className = "slot-container";
+
     const button = document.createElement("button");
     button.className = "button";
+    button.dataset.swapyItem = addon.id;
 
     const iconElement = document.createElement("i");
     iconElement.className = addon.iconClass;
@@ -73,8 +79,18 @@ document.addEventListener("DOMContentLoaded", async () => {
         );
       }
     };
-    buttonsGridDiv.appendChild(button);
+
+    slotDiv.appendChild(button);
+    buttonsGridDiv.appendChild(slotDiv);
   }
+
+  const container = document.querySelector<HTMLElement>('.button-section');
+  if (!container) {
+    throw new Error('.button-section element not found');
+  }
+  const swapy = createSwapy(container, {
+    animation: 'dynamic'
+  });
 
   const settingsIcon = document.querySelector(".settings-icon");
   if (settingsIcon) {
