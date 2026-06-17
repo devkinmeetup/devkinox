@@ -1,11 +1,11 @@
-import { loadAddons, getCurrentTab, executeScriptByFile } from "./core.js";
-import type { AddonDefinition } from "./core.js";
 import { createSwapy } from 'swapy'
+import type { AddonDefinition } from "./core.js";
+import { executeScriptByFile, getCurrentTab, loadAddons } from "./core.js";
 
 document.addEventListener("DOMContentLoaded", async () => {
   const addons: AddonDefinition[] = await loadAddons();
-  const buttonsGridDiv = document.getElementById("buttons-grid");
-  const noAddonsMessageDiv = document.getElementById("no-addons-message");
+  const buttonsGridDiv = document.getElementById("buttons-grid") as HTMLDivElement | null;
+  const noAddonsMessageDiv = document.getElementById("no-addons-message") as HTMLDivElement | null;
 
   if (!buttonsGridDiv || !noAddonsMessageDiv) return;
 
@@ -19,9 +19,50 @@ document.addEventListener("DOMContentLoaded", async () => {
   noAddonsMessageDiv.style.display = "none";
   buttonsGridDiv.style.display = "grid";
 
-  for (const addon of addons) {
+  const savedSlotItem = localStorage.getItem("slotItem");
+  let slotOrder: Record<string, string> = {};
+
+  if (savedSlotItem) {
+    try {
+      slotOrder = JSON.parse(savedSlotItem) as Record<string, string>;
+    } catch (e) {
+      console.error("Failed to parse slotItem from localStorage", e);
+    }
+  }
+
+  const addonMap = new Map<string, AddonDefinition>(
+    addons.map(addon => [addon.id, addon])
+  );
+
+  // 1. 保存された順番（slotOrder）に従ってスロットを作成
+  const orderedSlotIds: string[] = Object.keys(slotOrder).sort((a, b) => Number(a) - Number(b));
+  const renderedAddonIds = new Set<string>();
+
+  orderedSlotIds.forEach((slotId: string) => {
+    const addonId = slotOrder[slotId];
+    const addon = addonMap.get(addonId);
+    if (addon) {
+      createSlotAndButton(slotId, addon);
+      renderedAddonIds.add(addon.id);
+    }
+  });
+
+  // 2. まだ描画されていないアドオン（新規追加分など）を空いているスロットに自動配置
+  let nextSlotId = 1;
+  addons.forEach((addon: AddonDefinition) => {
+    if (!renderedAddonIds.has(addon.id)) {
+      while (slotOrder[String(nextSlotId)]) {
+        nextSlotId++;
+      }
+      createSlotAndButton(String(nextSlotId), addon);
+      nextSlotId++;
+    }
+  });
+
+  // スロットとボタンを生成するヘルパー関数
+  function createSlotAndButton(slotId: string, addon: AddonDefinition): void {
     const slotDiv = document.createElement("div");
-    slotDiv.dataset.swapySlot = addon.id;
+    slotDiv.dataset.swapySlot = slotId;
     slotDiv.className = "slot-container";
 
     const button = document.createElement("button");
@@ -35,7 +76,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const textNode = document.createTextNode(addon.label);
     button.appendChild(textNode);
 
-    button.onclick = async () => {
+    button.onclick = async (): Promise<void> => {
       const tab = await getCurrentTab();
       if (tab?.id && tab.url) {
         const currentUrl = tab.url.toLowerCase();
@@ -79,8 +120,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         );
       }
     };
+
     slotDiv.appendChild(button);
-    buttonsGridDiv.appendChild(slotDiv);
+    buttonsGridDiv?.appendChild(slotDiv);
   }
 
   const container = document.querySelector<HTMLElement>('.button-section');
@@ -93,11 +135,19 @@ document.addEventListener("DOMContentLoaded", async () => {
     );
     throw new Error('');
   }
+
   const swapy = createSwapy(container, {
     animation: 'dynamic'
   });
 
-  const settingsIcon = document.querySelector(".settings-icon");
+  swapy.onSwap((event) => {
+    // event.newSlotItemMap.asObject に最新の { スロットID: アイテムID } が入っています
+    if (event?.newSlotItemMap?.asObject) {
+      localStorage.setItem("slotItem", JSON.stringify(event.newSlotItemMap.asObject));
+    }
+  });
+
+  const settingsIcon = document.querySelector(".settings-icon") as HTMLElement | null;
   if (settingsIcon) {
     settingsIcon.addEventListener("click", () => {
       console.log("[kintone Dev Tools] Settings icon clicked (dummy).");
