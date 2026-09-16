@@ -44,18 +44,52 @@ import type {
     return res.properties ?? {};
   };
 
-  const fetchAppName = async (
+  const fetchAppMeta = async (
     api: KintoneApi,
     appId: string,
-  ): Promise<string> => {
+  ): Promise<{ name: string; spaceId?: string }> => {
     try {
       const res = (await api(api.url("/k/v1/app.json", true), "GET", {
         id: appId,
       })) as Record<string, unknown>;
-      return typeof res.name === "string" && res.name ? res.name : "（名称不明）";
+      return {
+        name:
+          typeof res.name === "string" && res.name ? res.name : "（名称不明）",
+        spaceId: res.spaceId != null ? String(res.spaceId) : undefined,
+      };
     } catch {
-      return "（名称不明）";
+      return { name: "（名称不明）" };
     }
+  };
+
+  // 指定スペース内のアプリ一覧を取得（appId/name のみ。上限までページング）
+  const SPACE_SCAN_LIMIT = 100; // 走査する同スペースアプリ数の上限
+  const listSpaceApps = async (
+    api: KintoneApi,
+    spaceId: string,
+  ): Promise<{ apps: { appId: string; name: string }[]; limited: boolean }> => {
+    const apps: { appId: string; name: string }[] = [];
+    let offset = 0;
+    const pageSize = 100;
+    let limited = false;
+    while (true) {
+      const res = (await api(api.url("/k/v1/apps.json", true), "GET", {
+        spaceIds: [spaceId],
+        limit: pageSize,
+        offset,
+      })) as { apps?: { appId: string | number; name: string }[] };
+      const batch = res.apps ?? [];
+      for (const a of batch) {
+        apps.push({ appId: String(a.appId), name: a.name });
+      }
+      if (batch.length < pageSize) break;
+      offset += pageSize;
+      if (apps.length >= SPACE_SCAN_LIMIT) {
+        limited = true;
+        break;
+      }
+    }
+    return { apps: apps.slice(0, SPACE_SCAN_LIMIT), limited };
   };
 
   // エラーが権限起因（403）かどうかを best-effort で判定
@@ -157,6 +191,7 @@ import type {
     const visited = new Set<string>();
     const queue: string[] = [startAppId];
     let truncated = false;
+    let startSpaceId: string | undefined;
 
     while (queue.length > 0) {
       const appId = queue.shift() as string;
@@ -168,7 +203,9 @@ import type {
         break;
       }
 
-      const appName = await fetchAppName(api, appId);
+      const meta = await fetchAppMeta(api, appId);
+      const appName = meta.name;
+      if (appId === startAppId) startSpaceId = meta.spaceId;
       let status: FetchStatus = "ok";
       let properties: { [code: string]: FieldProperty } = {};
       try {
@@ -198,13 +235,99 @@ import type {
       }
     }
 
+    // ---- 被参照スキャン（起点アプリと同じスペース内限定） ----
+    // 同スペースの各アプリの参照先が、グラフ内のノードを指していれば
+    // 「被参照」としてそのアプリ（と該当エッジ）をグラフへ取り込む。
+    let spaceScanCount: number | undefined;
+    let spaceScanLimited = false;
+    if (startSpaceId != null && !truncated) {
+      try {
+        const { apps: spaceApps, limited } = await listSpaceApps(
+          api,
+          startSpaceId,
+        );
+        spaceScanLimited = limited;
+        // ノード未登録の同スペースアプリについて参照を先読みキャッシュ
+        const spaceRefs = new Map<string, FieldRef[]>();
+        const spaceName = new Map<string, string>();
+        for (const sa of spaceApps) {
+          spaceName.set(sa.appId, sa.name);
+          if (nodes.has(sa.appId)) continue;
+          try {
+            const props = await fetchFields(api, sa.appId);
+            spaceRefs.set(sa.appId, extractRefs(sa.appId, sa.name, props));
+          } catch {
+            // 読めないアプリは被参照を判定できないためスキップ
+            spaceRefs.set(sa.appId, []);
+          }
+        }
+        spaceScanCount = spaceApps.length;
+
+        // グラフ内ノードを参照するアプリをノードとして取り込む（連鎖も検出）
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const sa of spaceApps) {
+            if (nodes.has(sa.appId)) continue;
+            const refs = spaceRefs.get(sa.appId) ?? [];
+            const hit = refs.some(
+              (r) => r.relatedAppId && nodes.has(r.relatedAppId),
+            );
+            if (!hit) continue;
+            if (nodes.size >= MAX_APPS) {
+              truncated = true;
+              changed = false;
+              break;
+            }
+            nodes.set(sa.appId, {
+              appId: sa.appId,
+              appName: sa.name,
+              fetchStatus: "ok",
+              incoming: true,
+            });
+            changed = true;
+          }
+        }
+
+        // 取り込んだ被参照アプリの、グラフ内ノード向けエッジ/行を追加
+        for (const [appId, refs] of spaceRefs) {
+          if (!nodes.get(appId)?.incoming) continue;
+          for (const r of refs) {
+            if (!r.relatedAppId || !nodes.has(r.relatedAppId)) continue;
+            rows.push(r);
+            edges.push({
+              fromAppId: appId,
+              toAppId: r.relatedAppId,
+              fieldCode: r.fieldCode,
+              kind: r.kind,
+            });
+          }
+        }
+      } catch (err) {
+        console.warn("[Kintone Dev Tools] 被参照スキャン失敗:", err);
+      }
+    }
+
     // relatedAppName を解決（ノードに存在すれば名前を埋める）
     for (const row of rows) {
       const node = nodes.get(row.relatedAppId);
       row.relatedAppName = node ? node.appName : "";
     }
 
-    return { nodes: [...nodes.values()], edges, rows, truncated };
+    const incomingCount = [...nodes.values()].filter(
+      (nd) => nd.incoming,
+    ).length;
+
+    return {
+      nodes: [...nodes.values()],
+      edges,
+      rows,
+      truncated,
+      startSpaceId,
+      spaceScanCount,
+      spaceScanLimited,
+      incomingCount,
+    };
   };
 
   // ---- ユーティリティ ------------------------------------------------------
@@ -422,7 +545,12 @@ import type {
   const buildSvgElement = (
     graph: TraceGraph,
     startAppId: string,
-  ): SVGSVGElement => {
+  ): {
+    svg: SVGSVGElement;
+    positions: Map<string, { x: number; y: number }>;
+    layout: Map<string, { short: string; w: number; h: number }>;
+    setKindVisible: (kind: string, visible: boolean) => void;
+  } => {
     const width = 760;
     const height = 520;
     const cx = width / 2;
@@ -503,20 +631,53 @@ import type {
       nodeLayout.set(node.appId, { short, w, h });
     }
 
-    // エッジ要素を作り、pos から座標を再計算できるよう参照を保持
+    // 種別ごとの表示ON/OFF状態
+    const show: Record<string, boolean> = {
+      LOOKUP: true,
+      REFERENCE_TABLE: true,
+    };
+
+    // エッジ要素を作り、pos から座標を再計算できるよう参照を保持。
+    // ラベルは種別付きで保持し、表示状態に応じて再構築する。
     const truncLine = (s: string): string =>
       s.length > 24 ? `${s.slice(0, 23)}…` : s;
+
+    // (from,to) 単位に集約し、種別付き項目を保持
+    const pairMap = new Map<
+      string,
+      {
+        from: string;
+        to: string;
+        items: { kind: string; fieldCode: string }[];
+        seen: Set<string>;
+      }
+    >();
+    for (const e of graph.edges) {
+      if (!pos.has(e.fromAppId) || !pos.has(e.toAppId)) continue;
+      const key = `${e.fromAppId}->${e.toAppId}`;
+      let cur = pairMap.get(key);
+      if (!cur) {
+        cur = { from: e.fromAppId, to: e.toAppId, items: [], seen: new Set() };
+        pairMap.set(key, cur);
+      }
+      const ik = `${e.kind}:${e.fieldCode}`;
+      if (!cur.seen.has(ik)) {
+        cur.seen.add(ik);
+        cur.items.push({ kind: e.kind, fieldCode: e.fieldCode });
+      }
+    }
+
     const edgeRecords: {
       from: string;
       to: string;
       el: SVGLineElement | SVGPathElement;
       text: SVGTextElement;
+      items: { kind: string; label: string }[];
       tspans: SVGTSpanElement[];
       self: boolean;
     }[] = [];
-    for (const e of aggregateEdges(graph.edges, true)) {
-      if (!pos.has(e.from) || !pos.has(e.to)) continue;
-      const self = e.from === e.to;
+    for (const grp of pairMap.values()) {
+      const self = grp.from === grp.to;
       const el = self
         ? svgEl("path", {
             fill: "none",
@@ -534,17 +695,45 @@ import type {
         fill: "#455a64",
         "text-anchor": self ? "start" : "middle",
       });
-      // 1ラベル=1行（tspan）。改行区切りで表示する。
-      const tspans = e.labels.map((lab, i) => {
-        const t = svgEl("tspan", { x: 0, dy: i === 0 ? "0" : "1.15em" });
-        t.textContent = truncLine(lab);
-        text.appendChild(t);
-        return t;
-      });
+      // 種別（ルックアップ→関連レコード）→フィールドコード順にソート
+      grp.items.sort(
+        (a, b) =>
+          kindRank(a.kind) - kindRank(b.kind) ||
+          a.fieldCode.localeCompare(b.fieldCode),
+      );
+      const items = grp.items.map((it) => ({
+        kind: it.kind,
+        label: `${kindEmoji(it.kind)}${it.fieldCode}`,
+      }));
       edgeLayer.appendChild(el);
       edgeLayer.appendChild(text);
-      edgeRecords.push({ from: e.from, to: e.to, el, text, tspans, self });
+      edgeRecords.push({
+        from: grp.from,
+        to: grp.to,
+        el,
+        text,
+        items,
+        tspans: [],
+        self,
+      });
     }
+
+    // 表示状態に応じてラベル(tspan)を再構築し、エッジの表示/非表示も切替
+    const rebuildEdgeLabels = (): void => {
+      for (const ed of edgeRecords) {
+        while (ed.text.firstChild) ed.text.removeChild(ed.text.firstChild);
+        const vis = ed.items.filter((it) => show[it.kind]);
+        ed.tspans = vis.map((it, i) => {
+          const t = svgEl("tspan", { x: 0, dy: i === 0 ? "0" : "1.15em" });
+          t.textContent = truncLine(it.label);
+          ed.text.appendChild(t);
+          return t;
+        });
+        const any = vis.length > 0;
+        ed.el.style.display = any ? "" : "none";
+        ed.text.style.display = any ? "" : "none";
+      }
+    };
 
     // 複数行ラベルを配置する（全 tspan の x を揃え、先頭行の y を設定）
     const LINE_H = 11.5;
@@ -597,7 +786,15 @@ import type {
         placeLabel(ed, (x1 + x2) / 2, (y1 + y2) / 2 - 4 - (n - 1) * LINE_H);
       }
     };
+    rebuildEdgeLabels();
     redrawEdges();
+
+    // 種別の表示ON/OFFを外部から切り替える
+    const setKindVisible = (kind: string, visible: boolean): void => {
+      show[kind] = visible;
+      rebuildEdgeLabels();
+      redrawEdges();
+    };
 
     // ノード（起点アプリは強調するため後ろ＝前面に描画）
     const orderedNodes = [
@@ -619,14 +816,26 @@ import type {
         transform: `translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`,
         style: "cursor:grab;",
       });
+      // 被参照ノード（incoming）は緑系で区別
+      const isIncoming = !!node.incoming;
+      const fillColor = isStart
+        ? "#fff8e1"
+        : isIncoming
+          ? "#e8f5e9"
+          : nodeFill(node.fetchStatus);
+      const strokeColor = isStart
+        ? "#f9a825"
+        : isIncoming
+          ? "#43a047"
+          : nodeStroke(node.fetchStatus);
       const rectAttrs: Record<string, string | number> = {
         x: -w / 2,
         y: -h / 2,
         width: w,
         height: h,
         rx: 6,
-        fill: isStart ? "#fff8e1" : nodeFill(node.fetchStatus),
-        stroke: isStart ? "#f9a825" : nodeStroke(node.fetchStatus),
+        fill: fillColor,
+        stroke: strokeColor,
         "stroke-width": isStart ? 3 : 1.5,
       };
       if (isStart) rectAttrs.filter = "url(#ftGlow)";
@@ -635,7 +844,7 @@ import type {
       // すべてのノードにアプリIDのタブを付与
       const idText = String(node.appId);
       const tabW = Math.max(30, idText.length * 7 + 12);
-      const tabColor = isStart ? "#f9a825" : nodeStroke(node.fetchStatus);
+      const tabColor = strokeColor;
       g.appendChild(
         svgEl("rect", {
           x: -w / 2,
@@ -724,7 +933,70 @@ import type {
       nodeLayer.appendChild(g);
     }
 
-    return svg;
+    return { svg, positions: pos, layout: nodeLayout, setKindVisible };
+  };
+
+  // 現在のグラフ配置を draw.io (mxGraph) XML に変換する
+  const xmlEsc = (s: string): string =>
+    s
+      .split("&").join("&amp;")
+      .split("<").join("&lt;")
+      .split(">").join("&gt;")
+      .split('"').join("&quot;")
+      .split("\n").join("&#10;");
+
+  const toDrawioXml = (
+    graph: TraceGraph,
+    positions: Map<string, { x: number; y: number }>,
+    layout: Map<string, { short: string; w: number; h: number }>,
+    startAppId: string,
+  ): string => {
+    const cells: string[] = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>'];
+
+    for (const node of graph.nodes) {
+      const p = positions.get(node.appId) ?? { x: 400, y: 260 };
+      const dim = layout.get(node.appId);
+      const w = dim?.w ?? 120;
+      const h = dim?.h ?? 40;
+      const isStart = node.appId === startAppId;
+      let fill = "#e3f2fd";
+      let stroke = "#1e88e5";
+      if (isStart) {
+        fill = "#fff8e1";
+        stroke = "#f9a825";
+      } else if (node.incoming) {
+        fill = "#e8f5e9";
+        stroke = "#43a047";
+      } else if (node.fetchStatus !== "ok") {
+        fill = "#eeeeee";
+        stroke = "#9e9e9e";
+      }
+      const style = `rounded=1;whiteSpace=wrap;html=1;fillColor=${fill};strokeColor=${stroke};`;
+      const value = xmlEsc(`${node.appName} (${node.appId})`);
+      const x = (p.x - w / 2).toFixed(1);
+      const y = (p.y - h / 2).toFixed(1);
+      cells.push(
+        `<mxCell id="n${node.appId}" value="${value}" style="${style}" vertex="1" parent="1"><mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry"/></mxCell>`,
+      );
+    }
+
+    let i = 0;
+    for (const e of aggregateEdges(graph.edges, true)) {
+      const value = xmlEsc(e.labels.join("\n"));
+      // エッジは直線（edgeStyle=none で経由点なしの直線ルーティング）
+      const style =
+        "edgeStyle=none;rounded=0;curved=0;html=1;endArrow=classic;fontSize=10;";
+      cells.push(
+        `<mxCell id="e${i}" value="${value}" style="${style}" edge="1" parent="1" source="n${e.from}" target="n${e.to}"><mxGeometry relative="1" as="geometry"/></mxCell>`,
+      );
+      i++;
+    }
+
+    return `<mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+  <root>
+    ${cells.join("\n    ")}
+  </root>
+</mxGraphModel>`;
   };
 
   const toMermaid = (graph: TraceGraph): string => {
@@ -822,13 +1094,50 @@ import type {
 
     const hint = document.createElement("p");
     hint.textContent =
-      "※ ノードをドラッグして配置を調整できます。📥=ルックアップ / 👀=関連レコード";
+      "※ ノードをドラッグして配置を調整できます。📥=ルックアップ / 👀=関連レコード。黄枠=起点 / 緑枠=被参照(同スペース)";
     hint.style.cssText = "margin: 0 0 6px 0; font-size: 0.75em; color: #888;";
     container.appendChild(hint);
 
+    const { svg, positions, layout, setKindVisible } = buildSvgElement(
+      graph,
+      startAppId,
+    );
+
+    // 種別ごとのエッジ表示ON/OFF（コピー系エクスポートにも反映する）
+    const visibleKinds: Record<string, boolean> = {
+      LOOKUP: true,
+      REFERENCE_TABLE: true,
+    };
+    // 表示中の種別だけにエッジを絞り込んだグラフを返す
+    const filteredGraph = (): TraceGraph => ({
+      ...graph,
+      edges: graph.edges.filter((e) => visibleKinds[e.kind]),
+    });
+
+    const filterBar = document.createElement("div");
+    filterBar.style.cssText =
+      "display: flex; gap: 16px; margin: 0 0 6px 0; font-size: 0.8em; color: #555;";
+    const makeToggle = (kind: string, text: string): HTMLLabelElement => {
+      const label = document.createElement("label");
+      label.style.cssText =
+        "display: inline-flex; align-items: center; gap: 4px; cursor: pointer;";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = true;
+      cb.onchange = () => {
+        visibleKinds[kind] = cb.checked;
+        setKindVisible(kind, cb.checked);
+      };
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(text));
+      return label;
+    };
+    filterBar.appendChild(makeToggle("LOOKUP", "📥 ルックアップ"));
+    filterBar.appendChild(makeToggle("REFERENCE_TABLE", "👀 関連レコード"));
+    container.appendChild(filterBar);
+
     const svgWrap = document.createElement("div");
     svgWrap.style.cssText = "overflow: auto; max-height: 60vh;";
-    const svg = buildSvgElement(graph, startAppId);
     svgWrap.appendChild(svg);
     container.appendChild(svgWrap);
 
@@ -846,7 +1155,7 @@ import type {
 
     const mermaidBtn = makeButton("Mermaidをコピー", "#8e44ad");
     mermaidBtn.onclick = async () => {
-      const ok = await copyTextToClipboard(toMermaid(graph));
+      const ok = await copyTextToClipboard(toMermaid(filteredGraph()));
       mermaidBtn.textContent = ok ? "コピーしました" : "コピー失敗";
       setTimeout(() => {
         mermaidBtn.textContent = "Mermaidをコピー";
@@ -855,16 +1164,29 @@ import type {
 
     const dotBtn = makeButton("DOTをコピー", "#8e44ad");
     dotBtn.onclick = async () => {
-      const ok = await copyTextToClipboard(toDot(graph));
+      const ok = await copyTextToClipboard(toDot(filteredGraph()));
       dotBtn.textContent = ok ? "コピーしました" : "コピー失敗";
       setTimeout(() => {
         dotBtn.textContent = "DOTをコピー";
       }, 1500);
     };
 
+    // draw.io は現在の配置（ドラッグ後の座標）を反映して出力
+    const drawioBtn = makeButton("draw.ioをコピー", "#8e44ad");
+    drawioBtn.onclick = async () => {
+      const ok = await copyTextToClipboard(
+        toDrawioXml(filteredGraph(), positions, layout, startAppId),
+      );
+      drawioBtn.textContent = ok ? "コピーしました" : "コピー失敗";
+      setTimeout(() => {
+        drawioBtn.textContent = "draw.ioをコピー";
+      }, 1500);
+    };
+
     btnBar.appendChild(imageBtn);
     btnBar.appendChild(mermaidBtn);
     btnBar.appendChild(dotBtn);
+    btnBar.appendChild(drawioBtn);
     container.appendChild(btnBar);
 
     return container;
@@ -907,7 +1229,10 @@ import type {
     dialog.appendChild(title);
 
     const summary = document.createElement("p");
-    summary.textContent = `起点アプリ: ${startAppId} / 対象アプリ数: ${graph.nodes.length} / 参照フィールド数: ${graph.rows.length}`;
+    const incomingText = graph.incomingCount
+      ? ` / 被参照アプリ数: ${graph.incomingCount}`
+      : "";
+    summary.textContent = `起点アプリ: ${startAppId} / 対象アプリ数: ${graph.nodes.length}${incomingText} / 参照フィールド数: ${graph.rows.length}`;
     summary.style.cssText =
       "margin: 0 0 10px 0; text-align: center; font-size: 0.85em; color: #555;";
     dialog.appendChild(summary);
@@ -920,9 +1245,19 @@ import type {
       dialog.appendChild(warn);
     }
 
+    if (graph.spaceScanLimited) {
+      const warn = document.createElement("p");
+      warn.textContent = `※ 同スペースのアプリが多いため被参照スキャンを ${graph.spaceScanCount} 件までに制限しました。`;
+      warn.style.cssText =
+        "margin: 0 0 8px 0; text-align: center; font-size: 0.8em; color: #c62828;";
+      dialog.appendChild(warn);
+    }
+
     const note = document.createElement("p");
     note.textContent =
-      "※ このアプリから参照している先（outgoing）のみを辿ります。このアプリを参照している外部アプリ（incoming）は対象外です。";
+      graph.startSpaceId != null
+        ? `※ 参照先（outgoing）は再帰的に辿ります。被参照（incoming）は起点と同じスペース内のアプリ${graph.spaceScanCount != null ? `（${graph.spaceScanCount}件走査）` : ""}のみ検出します。`
+        : "※ 参照先（outgoing）は再帰的に辿ります。起点アプリがスペースに属さないため被参照（incoming）は検出できません。";
     note.style.cssText =
       "margin: 0 0 10px 0; text-align: center; font-size: 0.75em; color: #888;";
     dialog.appendChild(note);

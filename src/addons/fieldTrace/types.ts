@@ -63,6 +63,7 @@ export interface AppNode {
   appId: string;
   appName: string;
   fetchStatus: FetchStatus;
+  incoming?: boolean; // 同スペース内の被参照スキャンで追加されたノード
 }
 
 /** アプリ単位のエッジ（fromApp が relatedApp を参照） */
@@ -79,4 +80,8 @@ export interface TraceGraph {
   edges: AppEdge[];
   rows: FieldRef[];
   truncated: boolean; // アプリ数上限に達して打ち切ったか
+  startSpaceId?: string; // 起点アプリのスペースID（被参照スキャン対象）
+  spaceScanCount?: number; // 被参照スキャンで走査した同スペースアプリ数
+  spaceScanLimited?: boolean; // スキャン対象数が上限を超えたか
+  incomingCount?: number; // 被参照として追加されたアプリ数
 }
