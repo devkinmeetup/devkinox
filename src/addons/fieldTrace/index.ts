@@ -217,7 +217,12 @@ import type {
           err,
         );
       }
-      nodes.set(appId, { appId, appName, fetchStatus: status });
+      nodes.set(appId, {
+        appId,
+        appName,
+        fetchStatus: status,
+        spaceId: meta.spaceId,
+      });
 
       if (status !== "ok") continue;
 
@@ -284,6 +289,7 @@ import type {
               appName: sa.name,
               fetchStatus: "ok",
               incoming: true,
+              spaceId: startSpaceId,
             });
             changed = true;
           }
@@ -368,6 +374,10 @@ import type {
 
   const kindEmoji = (kind: string): string =>
     kind === "LOOKUP" ? "📥" : "👀";
+
+  // 種別ごとのエッジ色（ルックアップ=青 / 関連レコード=橙）
+  const kindColor = (kind: string): string =>
+    kind === "LOOKUP" ? "#1565c0" : "#e67e22";
 
   const esc = (s: string): string =>
     s
@@ -550,14 +560,29 @@ import type {
     positions: Map<string, { x: number; y: number }>;
     layout: Map<string, { short: string; w: number; h: number }>;
     setKindVisible: (kind: string, visible: boolean) => void;
+    zoomBy: (factor: number) => void;
+    setZoom: (z: number) => void;
   } => {
-    const width = 760;
-    const height = 520;
+    // 論理座標サイズ。実際の表示は viewBox でコンテナに合わせてスケールする。
+    const LW = 1000;
+    const LH = 700;
+    const width = LW;
+    const height = LH;
     const cx = width / 2;
     const cy = height / 2;
     const nodeList = graph.nodes;
     const n = nodeList.length;
     const radius = Math.max(60, Math.min(width, height) / 2 - 110);
+
+    // 起点と異なるスペースのアプリは半透明で表示する
+    const nodeById = new Map(nodeList.map((nd) => [nd.appId, nd]));
+    const startSpace = graph.startSpaceId;
+    const isOtherSpace = (appId: string): boolean => {
+      if (startSpace == null) return false;
+      const nd = nodeById.get(appId);
+      return nd?.spaceId != null && nd.spaceId !== startSpace;
+    };
+    const FADE_OPACITY = "0.4";
 
     // 初期配置（円環レイアウト）。pos はドラッグで更新される可変状態。
     const pos = new Map<string, { x: number; y: number }>();
@@ -573,23 +598,31 @@ import type {
       }
     });
 
+    // viewBox はコンテナ実サイズと zoom から動的に決める（applyView）。
+    // これにより「拡大＝可視範囲が広がる／ノード等倍」「＋−＝ノードごと拡縮」を両立。
     const svg = svgEl("svg", {
-      width,
-      height,
-      style: "background:#fafafa;border:1px solid #e0e0e0;touch-action:none;",
+      viewBox: `0 0 ${LW} ${LH}`,
+      preserveAspectRatio: "xMidYMid meet",
+      style:
+        "display:block;width:100%;height:100%;background:#fafafa;border:1px solid #e0e0e0;touch-action:none;",
     });
     const defs = svgEl("defs", {});
-    const marker = svgEl("marker", {
-      id: "ftArrow",
-      markerWidth: 10,
-      markerHeight: 10,
-      refX: 9,
-      refY: 3,
-      orient: "auto",
-      markerUnits: "strokeWidth",
-    });
-    marker.appendChild(svgEl("path", { d: "M0,0 L9,3 L0,6 Z", fill: "#607d8b" }));
-    defs.appendChild(marker);
+    // 種別ごとの矢印マーカー（線色と揃える）
+    for (const k of ["LOOKUP", "REFERENCE_TABLE"]) {
+      const marker = svgEl("marker", {
+        id: `ftArrow_${k}`,
+        markerWidth: 10,
+        markerHeight: 10,
+        refX: 9,
+        refY: 3,
+        orient: "auto",
+        markerUnits: "strokeWidth",
+      });
+      marker.appendChild(
+        svgEl("path", { d: "M0,0 L9,3 L0,6 Z", fill: kindColor(k) }),
+      );
+      defs.appendChild(marker);
+    }
     const filter = svgEl("filter", {
       id: "ftGlow",
       x: "-40%",
@@ -642,96 +675,116 @@ import type {
     const truncLine = (s: string): string =>
       s.length > 24 ? `${s.slice(0, 23)}…` : s;
 
-    // (from,to) 単位に集約し、種別付き項目を保持
-    const pairMap = new Map<
+    // (from,to,種別) 単位に集約し、種別ごとに色分けした線を描く
+    const groupMap = new Map<
       string,
       {
         from: string;
         to: string;
-        items: { kind: string; fieldCode: string }[];
+        kind: string;
+        fieldCodes: string[];
         seen: Set<string>;
       }
     >();
     for (const e of graph.edges) {
       if (!pos.has(e.fromAppId) || !pos.has(e.toAppId)) continue;
-      const key = `${e.fromAppId}->${e.toAppId}`;
-      let cur = pairMap.get(key);
+      const key = `${e.fromAppId}->${e.toAppId}::${e.kind}`;
+      let cur = groupMap.get(key);
       if (!cur) {
-        cur = { from: e.fromAppId, to: e.toAppId, items: [], seen: new Set() };
-        pairMap.set(key, cur);
+        cur = {
+          from: e.fromAppId,
+          to: e.toAppId,
+          kind: e.kind,
+          fieldCodes: [],
+          seen: new Set(),
+        };
+        groupMap.set(key, cur);
       }
-      const ik = `${e.kind}:${e.fieldCode}`;
-      if (!cur.seen.has(ik)) {
-        cur.seen.add(ik);
-        cur.items.push({ kind: e.kind, fieldCode: e.fieldCode });
+      if (!cur.seen.has(e.fieldCode)) {
+        cur.seen.add(e.fieldCode);
+        cur.fieldCodes.push(e.fieldCode);
       }
+    }
+
+    // ペアごとに存在する種別（同ペアに両種別あるとき平行オフセットする）
+    const pairKinds = new Map<string, string[]>();
+    for (const g of groupMap.values()) {
+      const pk = `${g.from}->${g.to}`;
+      const arr = pairKinds.get(pk) ?? [];
+      if (!arr.includes(g.kind)) arr.push(g.kind);
+      pairKinds.set(pk, arr);
+    }
+    for (const arr of pairKinds.values()) {
+      arr.sort((a, b) => kindRank(a) - kindRank(b));
     }
 
     const edgeRecords: {
       from: string;
       to: string;
+      kind: string;
       el: SVGLineElement | SVGPathElement;
       text: SVGTextElement;
-      items: { kind: string; label: string }[];
       tspans: SVGTSpanElement[];
       self: boolean;
+      offsetVal: number;
     }[] = [];
-    for (const grp of pairMap.values()) {
+    for (const grp of groupMap.values()) {
       const self = grp.from === grp.to;
+      const color = kindColor(grp.kind);
+      const marker = `url(#ftArrow_${grp.kind})`;
       const el = self
         ? svgEl("path", {
             fill: "none",
-            stroke: "#607d8b",
+            stroke: color,
             "stroke-width": 1.5,
-            "marker-end": "url(#ftArrow)",
+            "marker-end": marker,
           })
         : svgEl("line", {
-            stroke: "#607d8b",
+            stroke: color,
             "stroke-width": 1.5,
-            "marker-end": "url(#ftArrow)",
+            "marker-end": marker,
           });
       const text = svgEl("text", {
         "font-size": 10,
-        fill: "#455a64",
+        fill: color,
         "text-anchor": self ? "start" : "middle",
       });
-      // 種別（ルックアップ→関連レコード）→フィールドコード順にソート
-      grp.items.sort(
-        (a, b) =>
-          kindRank(a.kind) - kindRank(b.kind) ||
-          a.fieldCode.localeCompare(b.fieldCode),
-      );
-      const items = grp.items.map((it) => ({
-        kind: it.kind,
-        label: `${kindEmoji(it.kind)}${it.fieldCode}`,
-      }));
+      grp.fieldCodes.sort((a, b) => a.localeCompare(b));
+      const tspans = grp.fieldCodes.map((fc, i) => {
+        const t = svgEl("tspan", { x: 0, dy: i === 0 ? "0" : "1.15em" });
+        t.textContent = truncLine(`${kindEmoji(grp.kind)}${fc}`);
+        text.appendChild(t);
+        return t;
+      });
+      // 平行オフセット量（種別数で中央揃え）
+      const kinds = pairKinds.get(`${grp.from}->${grp.to}`) ?? [grp.kind];
+      const idx = kinds.indexOf(grp.kind);
+      const offsetVal = (idx - (kinds.length - 1) / 2) * 12;
+      // 別スペースへ渡る（または別スペースから来る）エッジは半透明
+      if (isOtherSpace(grp.from) || isOtherSpace(grp.to)) {
+        el.style.opacity = FADE_OPACITY;
+        text.style.opacity = FADE_OPACITY;
+      }
       edgeLayer.appendChild(el);
       edgeLayer.appendChild(text);
       edgeRecords.push({
         from: grp.from,
         to: grp.to,
+        kind: grp.kind,
         el,
         text,
-        items,
-        tspans: [],
+        tspans,
         self,
+        offsetVal,
       });
     }
 
-    // 表示状態に応じてラベル(tspan)を再構築し、エッジの表示/非表示も切替
+    // 種別の表示ON/OFFに応じて、その種別のエッジ全体を表示/非表示
     const rebuildEdgeLabels = (): void => {
       for (const ed of edgeRecords) {
-        while (ed.text.firstChild) ed.text.removeChild(ed.text.firstChild);
-        const vis = ed.items.filter((it) => show[it.kind]);
-        ed.tspans = vis.map((it, i) => {
-          const t = svgEl("tspan", { x: 0, dy: i === 0 ? "0" : "1.15em" });
-          t.textContent = truncLine(it.label);
-          ed.text.appendChild(t);
-          return t;
-        });
-        const any = vis.length > 0;
-        ed.el.style.display = any ? "" : "none";
-        ed.text.style.display = any ? "" : "none";
+        const vis = show[ed.kind];
+        ed.el.style.display = vis ? "" : "none";
+        ed.text.style.display = vis ? "" : "none";
       }
     };
 
@@ -759,10 +812,12 @@ import type {
           const w = nodeLayout.get(ed.from)?.w ?? 90;
           const rx = a.x + w / 2; // ノード右端
           const bulge = 42;
-          const d = `M ${rx.toFixed(1)} ${(a.y - 8).toFixed(1)} C ${(rx + bulge).toFixed(1)} ${(a.y - 26).toFixed(1)}, ${(rx + bulge).toFixed(1)} ${(a.y + 26).toFixed(1)}, ${rx.toFixed(1)} ${(a.y + 8).toFixed(1)}`;
+          const off = ed.offsetVal; // 同ペア両種別の縦ずらし
+          const cyl = a.y + off;
+          const d = `M ${rx.toFixed(1)} ${(cyl - 8).toFixed(1)} C ${(rx + bulge).toFixed(1)} ${(cyl - 26).toFixed(1)}, ${(rx + bulge).toFixed(1)} ${(cyl + 26).toFixed(1)}, ${rx.toFixed(1)} ${(cyl + 8).toFixed(1)}`;
           ed.el.setAttribute("d", d);
           // ラベル群を縦方向にほぼ中央寄せ
-          placeLabel(ed, rx + bulge + 6, a.y + 3 - ((n - 1) * LINE_H) / 2);
+          placeLabel(ed, rx + bulge + 6, cyl + 3 - ((n - 1) * LINE_H) / 2);
           continue;
         }
 
@@ -773,11 +828,14 @@ import type {
         const len = Math.hypot(dx, dy) || 1;
         const ux = dx / len;
         const uy = dy / len;
+        // 線に垂直な方向へ offsetVal だけ平行移動（種別で線を分離）
+        const ox = -uy * ed.offsetVal;
+        const oy = ux * ed.offsetVal;
         const pad = 46;
-        const x1 = a.x + ux * pad;
-        const y1 = a.y + uy * pad;
-        const x2 = b.x - ux * pad;
-        const y2 = b.y - uy * pad;
+        const x1 = a.x + ux * pad + ox;
+        const y1 = a.y + uy * pad + oy;
+        const x2 = b.x - ux * pad + ox;
+        const y2 = b.y - uy * pad + oy;
         ed.el.setAttribute("x1", x1.toFixed(1));
         ed.el.setAttribute("y1", y1.toFixed(1));
         ed.el.setAttribute("x2", x2.toFixed(1));
@@ -788,6 +846,81 @@ import type {
     };
     rebuildEdgeLabels();
     redrawEdges();
+
+    // ---- ズーム / 表示範囲 ----
+    // 1ワールド単位 = zoom px。viewBox のサイズを「実ピクセル / zoom」にすることで、
+    // コンテナ拡大時は可視範囲が広がり（ノード等倍）、zoom 変更時はノードごと拡縮する。
+    let zoom = 1;
+    // ビュー中心のワールド座標（背景ドラッグで移動＝パン）
+    let viewCX = LW / 2;
+    let viewCY = LH / 2;
+    const clampZoom = (z: number): number => Math.min(3, Math.max(0.3, z));
+    const applyView = (): void => {
+      const cw = svg.clientWidth || 760;
+      const ch = svg.clientHeight || 440;
+      const vw = cw / zoom;
+      const vh = ch / zoom;
+      const vx = viewCX - vw / 2;
+      const vy = viewCY - vh / 2;
+      svg.setAttribute(
+        "viewBox",
+        `${vx.toFixed(1)} ${vy.toFixed(1)} ${vw.toFixed(1)} ${vh.toFixed(1)}`,
+      );
+    };
+    const setZoom = (z: number): void => {
+      zoom = clampZoom(z);
+      applyView();
+    };
+    const zoomBy = (factor: number): void => setZoom(zoom * factor);
+    // マウスホイールでズームイン／アウト
+    svg.addEventListener(
+      "wheel",
+      (ev: WheelEvent) => {
+        ev.preventDefault();
+        zoomBy(ev.deltaY < 0 ? 1.1 : 1 / 1.1);
+      },
+      { passive: false },
+    );
+
+    // 背景ドラッグでキャンバスを移動（パン）。ノード上は対象外。
+    svg.style.cursor = "grab";
+    let panning = false;
+    let panLastX = 0;
+    let panLastY = 0;
+    svg.addEventListener("pointerdown", (ev: PointerEvent) => {
+      if (ev.target !== svg) return; // ノード等の上では開始しない
+      panning = true;
+      panLastX = ev.clientX;
+      panLastY = ev.clientY;
+      svg.style.cursor = "grabbing";
+      svg.setPointerCapture(ev.pointerId);
+    });
+    svg.addEventListener("pointermove", (ev: PointerEvent) => {
+      if (!panning) return;
+      viewCX -= (ev.clientX - panLastX) / zoom;
+      viewCY -= (ev.clientY - panLastY) / zoom;
+      panLastX = ev.clientX;
+      panLastY = ev.clientY;
+      applyView();
+    });
+    const endPan = (ev: PointerEvent): void => {
+      if (!panning) return;
+      panning = false;
+      svg.style.cursor = "grab";
+      try {
+        svg.releasePointerCapture(ev.pointerId);
+      } catch {
+        // capture 未設定時は無視
+      }
+    };
+    svg.addEventListener("pointerup", endPan);
+    svg.addEventListener("pointercancel", endPan);
+    // コンテナのサイズ変化（全画面切替やウィンドウリサイズ）に追従
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => applyView());
+      ro.observe(svg);
+    }
+    applyView();
 
     // 種別の表示ON/OFFを外部から切り替える
     const setKindVisible = (kind: string, visible: boolean): void => {
@@ -812,9 +945,10 @@ import type {
       const h = dim?.h ?? 32;
 
       // ノードは g(translate) にまとめ、子要素はローカル座標(原点中心)で配置
+      const faded = isOtherSpace(node.appId);
       const g = svgEl("g", {
         transform: `translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`,
-        style: "cursor:grab;",
+        style: `cursor:grab;${faded ? `opacity:${FADE_OPACITY};` : ""}`,
       });
       // 被参照ノード（incoming）は緑系で区別
       const isIncoming = !!node.incoming;
@@ -907,8 +1041,9 @@ import type {
         if (!dragging) return;
         const cur = pos.get(appId);
         if (!cur) return;
-        cur.x += ev.clientX - lastX;
-        cur.y += ev.clientY - lastY;
+        // 1ワールド単位 = zoom px なので、client座標差を zoom で割る
+        cur.x += (ev.clientX - lastX) / zoom;
+        cur.y += (ev.clientY - lastY) / zoom;
         lastX = ev.clientX;
         lastY = ev.clientY;
         g.setAttribute(
@@ -933,7 +1068,14 @@ import type {
       nodeLayer.appendChild(g);
     }
 
-    return { svg, positions: pos, layout: nodeLayout, setKindVisible };
+    return {
+      svg,
+      positions: pos,
+      layout: nodeLayout,
+      setKindVisible,
+      zoomBy,
+      setZoom,
+    };
   };
 
   // 現在のグラフ配置を draw.io (mxGraph) XML に変換する
@@ -971,7 +1113,13 @@ import type {
         fill = "#eeeeee";
         stroke = "#9e9e9e";
       }
-      const style = `rounded=1;whiteSpace=wrap;html=1;fillColor=${fill};strokeColor=${stroke};`;
+      // 起点と異なるスペースは半透明
+      const otherSpace =
+        graph.startSpaceId != null &&
+        node.spaceId != null &&
+        node.spaceId !== graph.startSpaceId;
+      const opacity = otherSpace ? "opacity=40;" : "";
+      const style = `rounded=1;whiteSpace=wrap;html=1;fillColor=${fill};strokeColor=${stroke};${opacity}`;
       const value = xmlEsc(`${node.appName} (${node.appId})`);
       const x = (p.x - w / 2).toFixed(1);
       const y = (p.y - h / 2).toFixed(1);
@@ -980,14 +1128,31 @@ import type {
       );
     }
 
+    // エッジは (from,to,種別) 単位に集約し、種別色で直線描画
+    const dEdge = new Map<
+      string,
+      { from: string; to: string; kind: string; fieldCodes: string[] }
+    >();
+    for (const e of graph.edges) {
+      const key = `${e.fromAppId}->${e.toAppId}::${e.kind}`;
+      let cur = dEdge.get(key);
+      if (!cur) {
+        cur = { from: e.fromAppId, to: e.toAppId, kind: e.kind, fieldCodes: [] };
+        dEdge.set(key, cur);
+      }
+      if (!cur.fieldCodes.includes(e.fieldCode)) cur.fieldCodes.push(e.fieldCode);
+    }
     let i = 0;
-    for (const e of aggregateEdges(graph.edges, true)) {
-      const value = xmlEsc(e.labels.join("\n"));
+    for (const eg of dEdge.values()) {
+      eg.fieldCodes.sort((a, b) => a.localeCompare(b));
+      const value = xmlEsc(
+        eg.fieldCodes.map((fc) => `${kindEmoji(eg.kind)}${fc}`).join("\n"),
+      );
+      const color = kindColor(eg.kind);
       // エッジは直線（edgeStyle=none で経由点なしの直線ルーティング）
-      const style =
-        "edgeStyle=none;rounded=0;curved=0;html=1;endArrow=classic;fontSize=10;";
+      const style = `edgeStyle=none;rounded=0;curved=0;html=1;endArrow=classic;fontSize=10;strokeColor=${color};fontColor=${color};`;
       cells.push(
-        `<mxCell id="e${i}" value="${value}" style="${style}" edge="1" parent="1" source="n${e.from}" target="n${e.to}"><mxGeometry relative="1" as="geometry"/></mxCell>`,
+        `<mxCell id="e${i}" value="${value}" style="${style}" edge="1" parent="1" source="n${eg.from}" target="n${eg.to}"><mxGeometry relative="1" as="geometry"/></mxCell>`,
       );
       i++;
     }
@@ -1029,10 +1194,13 @@ import type {
   // SVG要素を PNG Blob にラスタライズする（背景は白で塗る）
   const svgToPngBlob = (svg: SVGSVGElement): Promise<Blob> =>
     new Promise((resolve, reject) => {
-      const w = Number(svg.getAttribute("width")) || 760;
-      const h = Number(svg.getAttribute("height")) || 520;
+      const w = Number(svg.getAttribute("width")) || 1000;
+      const h = Number(svg.getAttribute("height")) || 700;
       const clone = svg.cloneNode(true) as SVGSVGElement;
       clone.setAttribute("xmlns", SVG_NS);
+      // 表示用の 100% スタイルを固定寸法へ上書きし、確実に論理サイズで描画
+      clone.style.width = `${w}px`;
+      clone.style.height = `${h}px`;
       const xml = new XMLSerializer().serializeToString(clone);
       const src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(xml)}`;
       const img = new Image();
@@ -1094,14 +1262,12 @@ import type {
 
     const hint = document.createElement("p");
     hint.textContent =
-      "※ ノードをドラッグして配置を調整できます。📥=ルックアップ / 👀=関連レコード。黄枠=起点 / 緑枠=被参照(同スペース)";
+      "※ ノードをドラッグして配置を調整できます。📥青線=ルックアップ / 👀橙線=関連レコード。黄枠=起点 / 緑枠=被参照(同スペース) / 半透明=別スペース";
     hint.style.cssText = "margin: 0 0 6px 0; font-size: 0.75em; color: #888;";
     container.appendChild(hint);
 
-    const { svg, positions, layout, setKindVisible } = buildSvgElement(
-      graph,
-      startAppId,
-    );
+    const { svg, positions, layout, setKindVisible, zoomBy, setZoom } =
+      buildSvgElement(graph, startAppId);
 
     // 種別ごとのエッジ表示ON/OFF（コピー系エクスポートにも反映する）
     const visibleKinds: Record<string, boolean> = {
@@ -1134,60 +1300,165 @@ import type {
     };
     filterBar.appendChild(makeToggle("LOOKUP", "📥 ルックアップ"));
     filterBar.appendChild(makeToggle("REFERENCE_TABLE", "👀 関連レコード"));
-    container.appendChild(filterBar);
 
     const svgWrap = document.createElement("div");
-    svgWrap.style.cssText = "overflow: auto; max-height: 60vh;";
+    svgWrap.style.cssText =
+      "overflow: hidden; width: 100%; height: 46vh; border-radius: 4px;";
     svgWrap.appendChild(svg);
+
+    // ズーム（＋−／リセット）。ノード・エッジごと拡縮する。
+    const zoomOutBtn = makeButton("－", "#607d8b");
+    zoomOutBtn.style.marginLeft = "auto";
+    zoomOutBtn.title = "縮小";
+    zoomOutBtn.onclick = () => zoomBy(1 / 1.2);
+    const zoomResetBtn = makeButton("100%", "#607d8b");
+    zoomResetBtn.title = "ズームをリセット";
+    zoomResetBtn.onclick = () => setZoom(1);
+    const zoomInBtn = makeButton("＋", "#607d8b");
+    zoomInBtn.title = "拡大";
+    zoomInBtn.onclick = () => zoomBy(1.2);
+
+    // 全画面／元サイズ切り替え（キャンバスの表示領域を拡縮。ノードは等倍）
+    let expanded = false;
+    const expandBtn = makeButton("⛶ 全画面", "#607d8b");
+    const applyExpand = (): void => {
+      const dialog = document.getElementById(DIALOG_ID);
+      if (expanded) {
+        if (dialog) {
+          dialog.style.width = "100vw";
+          dialog.style.height = "100vh";
+          dialog.style.maxWidth = "100vw";
+          dialog.style.maxHeight = "100vh";
+          dialog.style.top = "0";
+          dialog.style.left = "0";
+          dialog.style.transform = "none";
+          dialog.style.borderRadius = "0";
+        }
+        svgWrap.style.height = "80vh";
+        expandBtn.textContent = "🗕 元のサイズ";
+      } else {
+        if (dialog) {
+          dialog.style.width = "760px";
+          dialog.style.height = "";
+          dialog.style.maxWidth = "92vw";
+          dialog.style.maxHeight = "88vh";
+          dialog.style.top = "50%";
+          dialog.style.left = "50%";
+          dialog.style.transform = "translate(-50%, -50%)";
+          dialog.style.borderRadius = "8px";
+        }
+        svgWrap.style.height = "46vh";
+        expandBtn.textContent = "⛶ 全画面";
+      }
+    };
+    expandBtn.onclick = () => {
+      expanded = !expanded;
+      applyExpand();
+    };
+    filterBar.appendChild(zoomOutBtn);
+    filterBar.appendChild(zoomResetBtn);
+    filterBar.appendChild(zoomInBtn);
+    filterBar.appendChild(expandBtn);
+    container.appendChild(filterBar);
     container.appendChild(svgWrap);
 
-    const btnBar = document.createElement("div");
-    btnBar.style.cssText = "display: flex; gap: 8px; margin-top: 10px;";
+    // 出力形式の選択（ラジオ）＋ 右側にコピー／ダウンロード
+    type OutFmt = "png" | "mermaid" | "dot" | "drawio";
+    let selectedFmt: OutFmt = "png";
+    const formats: { id: OutFmt; label: string; ext: string; mime: string }[] =
+      [
+        { id: "png", label: "画像(PNG)", ext: "png", mime: "image/png" },
+        { id: "mermaid", label: "Mermaid", ext: "mmd", mime: "text/plain" },
+        { id: "dot", label: "DOT", ext: "dot", mime: "text/vnd.graphviz" },
+        { id: "drawio", label: "draw.io", ext: "drawio", mime: "application/xml" },
+      ];
 
-    const imageBtn = makeButton("画像をコピー", "#8e44ad");
-    imageBtn.onclick = async () => {
-      const ok = await copyGraphImage(svg);
-      imageBtn.textContent = ok ? "コピーしました" : "コピー失敗";
+    // 選択形式のテキストを生成（PNG はバイナリのため null）
+    const getText = (fmt: OutFmt): string | null => {
+      if (fmt === "mermaid") return toMermaid(filteredGraph());
+      if (fmt === "dot") return toDot(filteredGraph());
+      if (fmt === "drawio")
+        return toDrawioXml(filteredGraph(), positions, layout, startAppId);
+      return null;
+    };
+
+    const downloadBlob = (blob: Blob, filename: string): void => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+
+    const actionBar = document.createElement("div");
+    actionBar.style.cssText =
+      "display: flex; align-items: center; gap: 12px; margin-top: 10px;";
+
+    const fmtWrap = document.createElement("div");
+    fmtWrap.style.cssText =
+      "display: flex; gap: 12px; font-size: 0.85em; color: #555;";
+    for (const f of formats) {
+      const label = document.createElement("label");
+      label.style.cssText =
+        "display: inline-flex; align-items: center; gap: 4px; cursor: pointer;";
+      const r = document.createElement("input");
+      r.type = "radio";
+      r.name = "ft-out-format";
+      r.value = f.id;
+      r.checked = f.id === selectedFmt;
+      r.onchange = () => {
+        if (r.checked) selectedFmt = f.id;
+      };
+      label.appendChild(r);
+      label.appendChild(document.createTextNode(f.label));
+      fmtWrap.appendChild(label);
+    }
+
+    const flash = (btn: HTMLButtonElement, msg: string, base: string): void => {
+      btn.textContent = msg;
       setTimeout(() => {
-        imageBtn.textContent = "画像をコピー";
+        btn.textContent = base;
       }, 1500);
     };
 
-    const mermaidBtn = makeButton("Mermaidをコピー", "#8e44ad");
-    mermaidBtn.onclick = async () => {
-      const ok = await copyTextToClipboard(toMermaid(filteredGraph()));
-      mermaidBtn.textContent = ok ? "コピーしました" : "コピー失敗";
-      setTimeout(() => {
-        mermaidBtn.textContent = "Mermaidをコピー";
-      }, 1500);
+    const copyBtn = makeButton("コピー", "#8e44ad");
+    copyBtn.onclick = async () => {
+      let ok: boolean;
+      if (selectedFmt === "png") {
+        ok = await copyGraphImage(svg);
+      } else {
+        ok = await copyTextToClipboard(getText(selectedFmt) ?? "");
+      }
+      flash(copyBtn, ok ? "コピーしました" : "コピー失敗", "コピー");
     };
 
-    const dotBtn = makeButton("DOTをコピー", "#8e44ad");
-    dotBtn.onclick = async () => {
-      const ok = await copyTextToClipboard(toDot(filteredGraph()));
-      dotBtn.textContent = ok ? "コピーしました" : "コピー失敗";
-      setTimeout(() => {
-        dotBtn.textContent = "DOTをコピー";
-      }, 1500);
+    const downloadBtn = makeButton("ダウンロード", "#8e44ad");
+    downloadBtn.onclick = async () => {
+      const fmt = formats.find((f) => f.id === selectedFmt);
+      if (!fmt) return;
+      const filename = `field-trace.${fmt.ext}`;
+      try {
+        if (selectedFmt === "png") {
+          const blob = await svgToPngBlob(svg);
+          downloadBlob(blob, filename);
+        } else {
+          const text = getText(selectedFmt) ?? "";
+          downloadBlob(new Blob([text], { type: fmt.mime }), filename);
+        }
+        flash(downloadBtn, "保存しました", "ダウンロード");
+      } catch (err) {
+        console.error("[Kintone Dev Tools] ダウンロード失敗:", err);
+        flash(downloadBtn, "失敗", "ダウンロード");
+      }
     };
 
-    // draw.io は現在の配置（ドラッグ後の座標）を反映して出力
-    const drawioBtn = makeButton("draw.ioをコピー", "#8e44ad");
-    drawioBtn.onclick = async () => {
-      const ok = await copyTextToClipboard(
-        toDrawioXml(filteredGraph(), positions, layout, startAppId),
-      );
-      drawioBtn.textContent = ok ? "コピーしました" : "コピー失敗";
-      setTimeout(() => {
-        drawioBtn.textContent = "draw.ioをコピー";
-      }, 1500);
-    };
-
-    btnBar.appendChild(imageBtn);
-    btnBar.appendChild(mermaidBtn);
-    btnBar.appendChild(dotBtn);
-    btnBar.appendChild(drawioBtn);
-    container.appendChild(btnBar);
+    actionBar.appendChild(fmtWrap);
+    actionBar.appendChild(copyBtn);
+    actionBar.appendChild(downloadBtn);
+    container.appendChild(actionBar);
 
     return container;
   };
@@ -1220,7 +1491,7 @@ import type {
     const dialog = document.createElement("div");
     dialog.id = DIALOG_ID;
     dialog.style.cssText =
-      "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.2); z-index: 2147483647; width: 860px; max-width: 92vw; max-height: 88vh; overflow: auto; color: #333; text-align: left;";
+      "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.2); z-index: 2147483647; width: 760px; max-width: 92vw; max-height: 88vh; overflow: auto; color: #333; text-align: left;";
     dialog.onclick = (e) => e.stopPropagation();
 
     const title = document.createElement("h3");
@@ -1316,7 +1587,8 @@ import type {
     document.body.appendChild(overlay);
     document.body.appendChild(dialog);
 
-    activate(0);
+    // 初期表示はグラフタブ
+    activate(1);
   };
 
   // ---- ローディング表示 ----------------------------------------------------

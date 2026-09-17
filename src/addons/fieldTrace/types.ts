@@ -64,6 +64,7 @@ export interface AppNode {
   appName: string;
   fetchStatus: FetchStatus;
   incoming?: boolean; // 同スペース内の被参照スキャンで追加されたノード
+  spaceId?: string; // 所属スペースID（起点と異なる場合は半透明表示）
 }
 
 /** アプリ単位のエッジ（fromApp が relatedApp を参照） */
